@@ -149,10 +149,6 @@ void llama_server_stop() {
   // TODO - too verbose, remove once things are solid
   LOG_TEE("requesting llama server shutdown\n");
   ext_server_running = false;
-
-  // unblocks the update_slots() loop so it can clean up and exit
-  llama->request_cancel(0);
-
   ext_server_thread.join();
   delete llama;
   llama = NULL;
@@ -164,8 +160,14 @@ void llama_server_completion(const char *json_req, ext_server_resp_t *resp) {
   resp->id = -1;
   resp->msg[0] = '\0';
   try {
-    json data = json::parse(json_req);
-    resp->id = llama->request_completion(data, false, false, -1);
+    resp->id = llama->queue_tasks.get_new_id();
+    llama->queue_results.add_waiting_task_id(resp->id);
+    task_server task;
+    task.id = resp->id;
+    task.target_id = 0;
+    task.data = json::parse(json_req);
+    task.type = TASK_TYPE_COMPLETION;
+    llama->process_single_task(task);
   } catch (std::exception &e) {
     snprintf(resp->msg, resp->msg_len, "exception %s", e.what());
   } catch (...) {
@@ -183,16 +185,14 @@ void llama_server_completion_next_result(const int task_id,
   resp->json_resp = NULL;
   std::string result_json;
   try {
-    task_result result = llama->next_result(task_id);
+    task_result result = llama->queue_results.recv(task_id);
     result_json =
         result.result_json.dump(-1, ' ', false, json::error_handler_t::replace);
     resp->id = result.id;
     resp->stop = result.stop;
     resp->error = result.error;
-    if (result.error) {
-      llama->request_cancel(task_id);
-    } else if (result.stop) {
-      llama->request_cancel(task_id);
+    if (result.error || result.stop) {
+      llama->queue_results.remove_waiting_task_id(task_id);
     }
   } catch (std::exception &e) {
     resp->error = true;
@@ -222,7 +222,11 @@ void llama_server_completion_cancel(const int task_id, ext_server_resp_t *err) {
   err->id = 0;
   err->msg[0] = '\0';
   try {
-    llama->request_cancel(task_id);
+    task_server task;
+    task.type = TASK_TYPE_CANCEL;
+    task.target_id = task_id;
+    llama->process_single_task(task);
+    llama->queue_results.remove_waiting_task_id(task_id);
   } catch (std::exception &e) {
     err->id = -1;
     snprintf(err->msg, err->msg_len, "exception %s", e.what());
@@ -307,9 +311,18 @@ void llama_server_embedding(const char *json_req, char **json_resp,
     } else {
       prompt = "";
     }
-    const int task_id = llama->request_completion(
-        {{"prompt", prompt}, {"n_predict", 0}}, false, true, -1);
-    task_result result = llama->next_result(task_id);
+    const int task_id = llama->queue_tasks.get_new_id();
+    llama->queue_results.add_waiting_task_id(task_id);
+    task_server task;
+    task.id = task_id;
+    task.target_id = 0;
+    task.embedding_mode = true;
+    task.data = {{"prompt", prompt}, {"n_predict", 0}};
+    task.type = TASK_TYPE_COMPLETION;
+    llama->process_single_task(task);
+    task_result result = llama->queue_results.recv(task_id);
+    llama->queue_results.remove_waiting_task_id(task_id);
+
     std::string result_json = result.result_json.dump();
     const std::string::size_type size = result_json.size() + 1;
     *json_resp = new char[size];
